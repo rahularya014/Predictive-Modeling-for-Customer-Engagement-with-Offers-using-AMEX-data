@@ -1,4 +1,3 @@
-# If you haven’t already, install a Parquet engine (e.g. pyarrow)
 !pip install pyarrow
 
 import os
