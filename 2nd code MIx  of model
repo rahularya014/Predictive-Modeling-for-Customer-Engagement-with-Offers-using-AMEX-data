@@ -1,0 +1,141 @@
+#Step 1
+!pip install lightgbm xgboost --quiet
+
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+
+import gc
+
+#Step 2
+id_cols = ['id1','id2','id3','id4','id5']
+target_col = 'y'
+group_col = 'id1'
+features = [c for c in train.columns if c not in id_cols + [target_col]]
+
+X_train, y_train = train[features], train[target_col]
+X_test = test[features]
+groups = train[group_col].values
+
+batch_size = 100_000
+n_batches = int(np.ceil(len(X_train) / batch_size))
+lgb_preds_all, xgb_preds_all, rf_preds_all = [], [], []
+
+#Step 3 (MOdels)
+gkf = GroupKFold(n_splits=5)
+
+for fold, (trn_idx, val_idx) in enumerate(gkf.split(X_train, y_train, groups)):
+    print(f"\nFold {fold+1}")
+    X_tr, X_val = X_train.iloc[trn_idx], X_train.iloc[val_idx]
+    y_tr, y_val = y_train.iloc[trn_idx], y_train.iloc[val_idx]
+    group_tr = train.iloc[trn_idx].groupby(group_col).size().values
+    group_val = train.iloc[val_idx].groupby(group_col).size().values
+
+    # ── LightGBM Ranker
+    lgb_train = lgb.Dataset(X_tr, y_tr, group=group_tr)
+    lgb_val   = lgb.Dataset(X_val, y_val, group=group_val, reference=lgb_train)
+
+    lgb_params = {
+        'objective': 'lambdarank',
+        'metric': 'map',
+        'boosting_type': 'gbdt',
+        'learning_rate': 0.03,
+        'num_leaves': 256,
+        'max_depth': 12,
+        'min_data_in_leaf': 30,
+        'verbosity': -1,
+        'random_state': 42,
+        'eval_at': [7]
+    }
+
+    lgb_model = lgb.train(
+        lgb_params,
+        lgb_train,
+        valid_sets=[lgb_val],
+        num_boost_round=1000,
+        early_stopping_rounds=50,
+        verbose_eval=100
+    )
+
+    # ── XGBoost Ranker
+    xgb_model = xgb.XGBRanker(
+        objective='rank:pairwise',
+        booster='gbtree',
+        tree_method='hist',
+        eval_metric='map@7',
+        learning_rate=0.05,
+        max_depth=12,
+        n_estimators=500,
+        subsample=0.85,
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    xgb_model.fit(
+        X_tr, y_tr,
+        group=train.iloc[trn_idx].groupby(group_col).size().values,
+        eval_set=[(X_val, y_val)],
+        eval_group=[train.iloc[val_idx].groupby(group_col).size().values],
+        early_stopping_rounds=50,
+        verbose=100
+    )
+
+    # ── Random Forest
+    rf_model = RandomForestClassifier(
+        n_estimators=500,
+        max_depth=20,
+        min_samples_split=10,
+        n_jobs=-1,
+        random_state=42
+    )
+    rf_model.fit(X_tr, y_tr)
+
+    # ── Prediction in Batches
+    lgb_preds, xgb_preds, rf_preds = [], [], []
+    for i in tqdm(range(0, len(X_test), batch_size), desc="Batch Prediction"):
+        X_batch = X_test.iloc[i:i+batch_size]
+        lgb_preds.append(lgb_model.predict(X_batch))
+        xgb_preds.append(xgb_model.predict(X_batch))
+        rf_preds.append(rf_model.predict_proba(X_batch)[:, 1])
+        del X_batch
+        gc.collect()
+
+    lgb_preds_all.append(np.concatenate(lgb_preds))
+    xgb_preds_all.append(np.concatenate(xgb_preds))
+    rf_preds_all.append(np.concatenate(rf_preds))
+
+    del X_tr, y_tr, X_val, y_val, lgb_model, xgb_model, rf_model
+    gc.collect()
+    
+#Step 4
+# Average predictions across folds
+lgb_final = np.mean(lgb_preds_all, axis=0)
+xgb_final = np.mean(xgb_preds_all, axis=0)
+rf_final  = np.mean(rf_preds_all, axis=0)
+
+# Meta stacking model
+meta_features = np.vstack([lgb_final, xgb_final, rf_final]).T
+scaler = StandardScaler()
+meta_features = scaler.fit_transform(meta_features)
+
+meta_model = LogisticRegression()
+meta_model.fit(meta_features, np.full(len(meta_features), y_train.mean()))  # dummy y
+
+final_preds = meta_model.predict_proba(meta_features)[:, 1]
+
+#Step 5
+sub = test[['id1','id2','id3','id5']].copy()
+sub['pred'] = final_preds
+
+# Sort and rank top 7 offers per customer
+sub.sort_values(['id1','pred'], ascending=[True, False], inplace=True)
+sub['rank'] = sub.groupby('id1')['pred'].rank(method='first', ascending=False)
+sub_top7 = sub[sub['rank'] <= 7].drop(columns='rank')
+
+sub_top7.to_csv("submission_stack.csv", index=False)
+print("Saved → submission_stack.csv")
